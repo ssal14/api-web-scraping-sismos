@@ -1,91 +1,58 @@
 import requests
-from bs4 import BeautifulSoup
 import boto3
 import uuid
 import json
+from datetime import datetime
 
-# Página del IGP con los últimos sismos reportados
-URL = "https://ultimosismo.igp.gob.pe/productos/reportes-sismicos"
-
-
-def extraer_desde_tabla(soup):
-    """Mismo método usado en clase para la web de Bomberos: buscar un <table> en el HTML."""
-    table = soup.find('table')
-    if not table:
-        return []
-
-    encabezados = [th.text.strip() for th in table.find_all('th')]
-    filas = []
-    for row in table.find_all('tr')[1:]:  # se omite el encabezado
-        celdas = row.find_all('td')
-        if not celdas:
-            continue
-        fila = {}
-        for i, celda in enumerate(celdas):
-            nombre_col = encabezados[i] if i < len(encabezados) else f'col_{i}'
-            fila[nombre_col] = celda.text.strip()
-        filas.append(fila)
-    return filas
-
-
-def extraer_desde_json_embebido(soup):
-    """
-    Muchas webs modernas (como esta del IGP) no traen la tabla en el HTML, sino que
-    cargan los datos con JavaScript. Varias de ellas (Next.js) dejan los datos ya
-    listos dentro de un <script id="__NEXT_DATA__"> en formato JSON.
-    Si esto no aplica a tu caso, revisa con el navegador (F12 -> Network) cuál es
-    el request que trae los sismos y ajusta esta función para llamarlo con requests.
-    """
-    script_tag = soup.find('script', id='__NEXT_DATA__')
-    if not script_tag or not script_tag.string:
-        return []
-
-    try:
-        data = json.loads(script_tag.string)
-    except json.JSONDecodeError:
-        return []
-
-    # Ruta típica de Next.js. Si la estructura real es distinta, imprime "data"
-    # (por ejemplo devolviéndolo en el body) para ubicar dónde están los sismos.
-    page_props = data.get('props', {}).get('pageProps', {})
-    for clave in ('sismos', 'reportes', 'data', 'items', 'results'):
-        if clave in page_props and isinstance(page_props[clave], list):
-            return page_props[clave]
-    return []
+# API que usa internamente la página del IGP para mostrar la tabla de sismos
+# (se encontró revisando la pestaña Network del navegador: la página carga
+# https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/<anio> con JavaScript,
+# por eso un scraping directo del HTML no funcionaba).
+URL = "https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/{anio}"
 
 
 def lambda_handler(event, context):
+    anio = datetime.now().year
+
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                       '(KHTML, like Gecko) Chrome/120.0 Safari/537.36'
     }
 
-    response = requests.get(URL, headers=headers, timeout=15)
+    response = requests.get(URL.format(anio=anio), headers=headers, timeout=15)
     if response.status_code != 200:
         return {
             'statusCode': response.status_code,
-            'body': 'Error al acceder a la página web del IGP'
+            'body': 'Error al acceder a la API del IGP'
         }
 
-    soup = BeautifulSoup(response.content, 'html.parser')
+    # La API devuelve una lista con TODOS los sismos del año, ordenada del
+    # más antiguo (codigo 0001) al más reciente.
+    data = response.json()
 
-    # 1) Intento con el mismo método de clase (tabla HTML)
-    sismos = extraer_desde_tabla(soup)
-
-    # 2) Si no hay tabla, intento leer el JSON embebido de la página
-    if not sismos:
-        sismos = extraer_desde_json_embebido(soup)
-
-    if not sismos:
+    if not data:
         return {
             'statusCode': 404,
-            'body': 'No se encontró información de sismos en la página. '
-                    'Revise con el navegador (F12 > Elements/Network) la estructura '
-                    'real de la página y ajuste la función de extracción.'
+            'body': 'No se encontraron sismos para el año actual'
         }
 
-    # Nos quedamos solo con los 10 últimos sismos reportados
-    sismos = sismos[:10]
+    # Los 10 últimos son los últimos elementos del arreglo
+    ultimos_10 = data[-10:]
+    ultimos_10.reverse()  # para que el más reciente quede primero
+
+    sismos = []
+    for s in ultimos_10:
+        sismos.append({
+            'codigo': s.get('codigo'),
+            'fecha': (s.get('fecha_local') or '')[:10],      # YYYY-MM-DD
+            'hora': (s.get('hora_local') or '')[11:19],       # HH:MM:SS
+            'magnitud': s.get('magnitud'),
+            'profundidad': s.get('profundidad'),
+            'latitud': s.get('latitud'),
+            'longitud': s.get('longitud'),
+            'referencia': s.get('referencia'),
+            'intensidad': s.get('intensidad'),
+        })
 
     # Guardar en DynamoDB (igual que en el ejemplo de clase)
     dynamodb = boto3.resource('dynamodb')
